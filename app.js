@@ -1494,9 +1494,33 @@ app.post('/api/kyc/validate', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Document not found.' });
     }
 
-    // If Azure storage is active, validation is handled in the cloud by the Blob Trigger Azure Function
+    // If Azure storage is active, validation is normally handled in the cloud by the Blob Trigger Azure Function
     if (containerClient) {
-      res.json({
+      // If the Service Bus client is not initialized (e.g. running locally without SB credentials
+      // or the Function/App isn't consuming messages), fall back to the local simulator so the
+      // user doesn't wait indefinitely.
+      if (!serviceBusClient) {
+        // Trigger local simulator asynchronously but respond immediately to the client
+        const docType = doc.doc_type || 'Document';
+        const originalname = doc.original_name.replace(`${docType}: `, '');
+        triggerLocalVerificationSimulator(
+          req.user.id,
+          doc.id,
+          docType,
+          doc.file_name,
+          originalname,
+          doc.mime_type || 'application/pdf'
+        );
+
+        return res.json({
+          success: true,
+          status: 'Pending',
+          message: 'Document uploaded to Azure. Service Bus not configured locally — local verification simulator started.'
+        });
+      }
+
+      // Service Bus available — normal asynchronous processing
+      return res.json({
         success: true,
         status: 'Pending',
         message: 'Document uploaded to Azure. Validation is being processed asynchronously by the Azure Function.'
