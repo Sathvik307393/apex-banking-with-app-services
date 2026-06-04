@@ -86,6 +86,61 @@ function initAzureStorage() {
   }
 }
 
+async function clearAzureKYCContainers() {
+  const connStr = process.env.AZURE_STORAGE_CONNECTION_STRING;
+  if (!connStr || connStr.includes('your_account_name')) {
+    return { message: 'Azure storage is not configured.' };
+  }
+
+  const client = BlobServiceClient.fromConnectionString(connStr);
+  const containers = ['kyc-documents', 'processed-and-validated-container'];
+  const result = {
+    deleted: {
+      'kyc-documents': 0,
+      'processed-and-validated-container': 0
+    },
+    warnings: []
+  };
+
+  for (const targetContainerName of containers) {
+    try {
+      const targetClient = client.getContainerClient(targetContainerName);
+      const exists = await targetClient.exists();
+      if (!exists) {
+        result.warnings.push(`Container '${targetContainerName}' not found.`);
+        continue;
+      }
+
+      for await (const blob of targetClient.listBlobsFlat()) {
+        await targetClient.deleteBlob(blob.name);
+        result.deleted[targetContainerName] += 1;
+      }
+    } catch (error) {
+      result.warnings.push(`Failed to clear container '${targetContainerName}': ${error.message}`);
+    }
+  }
+
+  return result;
+}
+
+function clearLocalUploadFiles() {
+  if (!fs.existsSync(uploadDir)) return { deleted: 0 };
+  const files = fs.readdirSync(uploadDir);
+  let deleted = 0;
+  for (const file of files) {
+    try {
+      const filePath = path.join(uploadDir, file);
+      if (fs.lstatSync(filePath).isFile()) {
+        fs.unlinkSync(filePath);
+        deleted += 1;
+      }
+    } catch (error) {
+      console.warn('[LOCAL STORAGE CLEANUP] Failed to delete local upload file:', file, error.message);
+    }
+  }
+  return { deleted };
+}
+
 // Initialize Azure Storage client
 initAzureStorage();
 
@@ -1729,8 +1784,25 @@ app.post('/api/admin/reset-data', authenticateToken, requireAdmin, async (req, r
       data.kyc_forms = [];
       fs.writeFileSync(JSON_DB_PATH, JSON.stringify(data, null, 2));
     }
+
+    let storageCleanup = null;
+    let localCleanup = null;
+    try {
+      if (process.env.AZURE_STORAGE_CONNECTION_STRING && !process.env.AZURE_STORAGE_CONNECTION_STRING.includes('your_account_name')) {
+        storageCleanup = await clearAzureKYCContainers();
+      } else {
+        localCleanup = clearLocalUploadFiles();
+      }
+    } catch (cleanupError) {
+      console.error('[ADMIN] Storage cleanup failed:', cleanupError.message);
+    }
+
     console.log('[ADMIN] Database reset performed by admin:', req.user.id);
-    res.json({ message: 'Database reset successfully. All test data has been cleared. Admin credentials preserved.' });
+    res.json({
+      message: 'Database reset successfully. All test data has been cleared. Admin credentials preserved.',
+      storageCleanup,
+      localCleanup
+    });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Failed to reset database.' });
@@ -3670,7 +3742,8 @@ const htmlTemplate = `
           const valData = await validateRes.json();
           
           if (validateRes.ok) {
-            triggerToast(valData.message, 'success');
+            const toastType = valData.status === 'Pending' ? 'info' : 'success';
+            triggerToast(valData.message, toastType);
           } else {
             triggerToast(valData.error || 'Document validation failed.', 'error');
           }
